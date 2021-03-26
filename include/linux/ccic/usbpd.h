@@ -604,6 +604,7 @@ struct usbpd_data {
 	struct mutex		accept_mutex;
 	int 			is_prswap;
 
+	struct power_supply *psy_muic;
 	struct timeval		time1;
 	struct timeval		time2;
 };

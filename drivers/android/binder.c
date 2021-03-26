@@ -290,7 +290,7 @@ struct binder_device {
 struct binder_work {
 	struct list_head entry;
 
-	enum {
+	enum binder_work_type {
 		BINDER_WORK_TRANSACTION = 1,
 		BINDER_WORK_TRANSACTION_COMPLETE,
 		BINDER_WORK_RETURN_ERROR,
@@ -926,27 +926,6 @@ static struct binder_work *binder_dequeue_work_head_ilocked(
 	w = list_first_entry_or_null(list, struct binder_work, entry);
 	if (w)
 		list_del_init(&w->entry);
-	return w;
-}
-
-/**
- * binder_dequeue_work_head() - Dequeues the item at head of list
- * @proc:         binder_proc associated with list
- * @list:         list to dequeue head
- *
- * Removes the head of the list if there are items on the list
- *
- * Return: pointer dequeued binder_work, NULL if list was empty
- */
-static struct binder_work *binder_dequeue_work_head(
-					struct binder_proc *proc,
-					struct list_head *list)
-{
-	struct binder_work *w;
-
-	binder_inner_proc_lock(proc);
-	w = binder_dequeue_work_head_ilocked(list);
-	binder_inner_proc_unlock(proc);
 	return w;
 }
 
@@ -2940,74 +2919,6 @@ static struct binder_node *binder_get_node_refs_for_txn(
 	return target_node;
 }
 
-#ifdef CONFIG_SAMSUNG_FREECESS
-// 1) Skip first 8 bytes (useless data)
-// 2) Make sure that the invalid address issue is not occuring (j=9, j+=2)
-// 3) Java layer uses 2 bytes char. And only the first byte has the data. (p+=2)
-// 4) Parcel::writeInterfaceToken() in frameworks/native/libs/binder/Parcel.cpp
-static void freecess_async_binder_report(struct binder_proc *proc,
-					struct binder_proc *target_proc,
-					struct binder_transaction_data *tr,
-					struct binder_transaction *t)
-{
-	char buf_user[INTERFACETOKEN_BUFF_SIZE] = {0};
-	char buf[INTERFACETOKEN_BUFF_SIZE] = {0};
-	char *p = NULL;
-	int i = 0;
-	int j = 0;
-	int skip_bytes = 8;
-
-	if (!proc || !target_proc || !tr || !t)
-		return;
-
-	// for android P verson, skip 8 bytes; for Q version, skip 12 bytes;
-	if (freecess_fw_version == 0)
-		skip_bytes = 8;
-	else if (freecess_fw_version == 1)
-		skip_bytes = 12;
-
-	if ((tr->flags & TF_ONE_WAY) && target_proc
-		&& target_proc->tsk && target_proc->tsk->cred
-		&& (target_proc->tsk->cred->euid.val > 10000)
-		&& (proc->pid != target_proc->pid)) {
-		if (thread_group_is_frozen(target_proc->tsk)) {
-			if (t->buffer->data_size > skip_bytes) {
-				if (0 == copy_from_user(buf_user, (const void __user *)(uintptr_t)tr->data.ptr.buffer,
-					min_t(binder_size_t, tr->data_size, INTERFACETOKEN_BUFF_SIZE - 1))) {
-					p = &buf_user[skip_bytes];
-					i = 0;
-					j = skip_bytes + 1;
-					while (i < INTERFACETOKEN_BUFF_SIZE && j < t->buffer->data_size && *p != '\0') {
-						buf[i++] = *p;
-						j+=2;
-						p+=2;
-					}
-					if (i == INTERFACETOKEN_BUFF_SIZE) buf[i-1] = '\0';
-				}
-				binder_report(target_proc->tsk, tr->code, buf, tr->flags & TF_ONE_WAY);
-			}
-		}
-	}
-}
-
-static void freecess_sync_binder_report(struct binder_proc *proc,
-						struct binder_proc *target_proc,
-						struct binder_transaction_data *tr)
-{
-	if (!proc || !target_proc || !tr)
-		return;
-
-	if ((!(tr->flags & TF_ONE_WAY)) && target_proc
-		&& target_proc->tsk && target_proc->tsk->cred
-		&& (target_proc->tsk->cred->euid.val > 10000)
-		&& (proc->pid != target_proc->pid) 
-		&& thread_group_is_frozen(target_proc->tsk)) {
-		//if sync binder, we don't need detecting info, so set code and interfacename as default value.
-		binder_report(target_proc->tsk, 0, "sync_binder", tr->flags & TF_ONE_WAY);
-	}
-}
-#endif
-
 static void binder_transaction(struct binder_proc *proc,
 			       struct binder_thread *thread,
 			       struct binder_transaction_data *tr, int reply,
@@ -3149,9 +3060,12 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_dead_binder;
 		}
 		e->to_node = target_node->debug_id;
-
 #ifdef CONFIG_SAMSUNG_FREECESS
-		freecess_sync_binder_report(proc, target_proc, tr);
+		if (target_proc
+			&& (target_proc->tsk->cred->euid.val > 10000)
+			&& (proc->pid != target_proc->pid)) {
+			binder_report(proc->tsk, target_proc->tsk, tr->flags & TF_ONE_WAY);
+		}
 #endif
 
 		if (security_binder_transaction(proc->tsk,
@@ -3364,11 +3278,6 @@ static void binder_transaction(struct binder_proc *proc,
 		return_error_line = __LINE__;
 		goto err_bad_offset;
 	}
-
-#ifdef CONFIG_SAMSUNG_FREECESS
-	freecess_async_binder_report(proc, target_proc, tr, t);
-#endif
-	
 	off_end = (void *)off_start + tr->offsets_size;
 	sg_bufp = (u8 *)(PTR_ALIGN(off_end, sizeof(void *)));
 	sg_buf_end = sg_bufp + extra_buffers_size;
@@ -4567,13 +4476,17 @@ static void binder_release_work(struct binder_proc *proc,
 				struct list_head *list)
 {
 	struct binder_work *w;
+	enum binder_work_type wtype;
 
 	while (1) {
-		w = binder_dequeue_work_head(proc, list);
+		binder_inner_proc_lock(proc);
+		w = binder_dequeue_work_head_ilocked(list);
+		wtype = w ? w->type : 0;
+		binder_inner_proc_unlock(proc);
 		if (!w)
 			return;
 
-		switch (w->type) {
+		switch (wtype) {
 		case BINDER_WORK_TRANSACTION: {
 			struct binder_transaction *t;
 
@@ -4607,9 +4520,11 @@ static void binder_release_work(struct binder_proc *proc,
 			kfree(death);
 			binder_stats_deleted(BINDER_STAT_DEATH);
 		} break;
+		case BINDER_WORK_NODE:
+			break;
 		default:
 			pr_err("unexpected work type, %d, not freed\n",
-			       w->type);
+			       wtype);
 			break;
 		}
 	}
